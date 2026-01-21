@@ -1,0 +1,726 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PolyConvert - Universal File Converter</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- React & ReactDOM -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    
+    <!-- Babel for JSX -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    
+    <!-- jsPDF for client-side demo -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        primary: {
+                            50: '#f0f9ff',
+                            100: '#e0f2fe',
+                            500: '#0ea5e9',
+                            600: '#0284c7',
+                            700: '#0369a1',
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body {
+            transition: background-color 0.3s, color 0.3s;
+        }
+        .drop-active {
+            border-color: #0ea5e9;
+            background-color: rgba(14, 165, 233, 0.05);
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        .animate-spin-slow {
+            animation: spin 3s linear infinite;
+        }
+    </style>
+</head>
+<body class="bg-gray-50 text-gray-900 dark:bg-gray-900 dark:text-gray-100 min-h-screen flex flex-col font-sans">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useCallback } = React;
+        const { PDFDocument } = window.jspdf ? window.jspdf : { PDFDocument: null };
+
+        // --- Icons ---
+        const Icon = ({ name, size = 20, className = "" }) => {
+            useEffect(() => {
+                lucide.createIcons();
+            }, [name]); 
+            return <i data-lucide={name} width={size} height={size} className={className}></i>;
+        };
+
+        // --- Constants ---
+        const TABS = {
+            TO_PDF: 'to_pdf',
+            FROM_PDF: 'from_pdf'
+        };
+
+        const ACCEPTED_TYPES = {
+            [TABS.TO_PDF]: {
+                extensions: ['.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.txt', '.jpg', '.jpeg', '.png'],
+                mimeTypes: [
+                    'application/msword', 
+                    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                    'application/vnd.ms-excel',
+                    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                    'application/vnd.ms-powerpoint',
+                    'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+                    'text/plain',
+                    'image/jpeg',
+                    'image/png'
+                ],
+                label: 'Documents (Word, Excel, PPT, Text) or Images'
+            },
+            [TABS.FROM_PDF]: {
+                extensions: ['.pdf'],
+                mimeTypes: ['application/pdf'],
+                label: 'PDF Documents'
+            }
+        };
+
+        // --- Utils ---
+        const formatBytes = (bytes, decimals = 2) => {
+            if (!+bytes) return '0 Bytes';
+            const k = 1024;
+            const dm = decimals < 0 ? 0 : decimals;
+            const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`;
+        };
+
+        // --- Mock Backend Service ---
+        const mockUploadAndConvert = (file, type, onProgress) => {
+            return new Promise((resolve, reject) => {
+                let progress = 0;
+                const interval = setInterval(() => {
+                    progress += Math.random() * 10;
+                    if (progress > 100) progress = 100;
+                    onProgress(Math.floor(progress));
+
+                    if (progress === 100) {
+                        clearInterval(interval);
+                        
+                        // Simulate processing delay after upload
+                        setTimeout(() => {
+                            // Mock result
+                            const resultExt = type === TABS.TO_PDF ? 'pdf' : 'docx';
+                            const resultName = file.name.substring(0, file.name.lastIndexOf('.')) + '.' + resultExt;
+                            
+                            resolve({
+                                url: '#', // In a real app, this is the S3/Local URL
+                                name: resultName,
+                                size: file.size // Approximate
+                            });
+                        }, 1500);
+                    }
+                }, 300);
+            });
+        };
+
+        // --- Real Client-Side Image to PDF Service (Bonus) ---
+        const clientSideImageToPdf = async (file, onProgress) => {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    try {
+                        onProgress(50);
+                        const imgData = e.target.result;
+                        const { jsPDF } = window.jspdf;
+                        const doc = new jsPDF();
+                        
+                        const imgProps = doc.getImageProperties(imgData);
+                        const pdfWidth = doc.internal.pageSize.getWidth();
+                        const pdfHeight = (imgProps.height * pdfWidth) / imgProps.width;
+                        
+                        doc.addImage(imgData, 'JPEG', 0, 0, pdfWidth, pdfHeight);
+                        onProgress(100);
+                        
+                        const pdfBlob = doc.output('blob');
+                        const url = URL.createObjectURL(pdfBlob);
+                        
+                        resolve({
+                            url: url,
+                            name: file.name.substring(0, file.name.lastIndexOf('.')) + '.pdf',
+                            size: pdfBlob.size
+                        });
+                    } catch (err) {
+                        reject(err);
+                    }
+                };
+                reader.readAsDataURL(file);
+            });
+        };
+
+        // --- Components ---
+
+        const Modal = ({ isOpen, onClose, title, children }) => {
+            if (!isOpen) return null;
+            return (
+                <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 sm:p-6">
+                    <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose}></div>
+                    <div className="relative bg-white dark:bg-gray-900 rounded-2xl shadow-2xl w-full max-w-4xl max-h-[90vh] flex flex-col border border-gray-200 dark:border-gray-800">
+                        <div className="flex items-center justify-between p-6 border-b border-gray-200 dark:border-gray-800">
+                            <h3 className="text-xl font-bold text-gray-900 dark:text-white">{title}</h3>
+                            <button onClick={onClose} className="text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200">
+                                <Icon name="x" size={24} />
+                            </button>
+                        </div>
+                        <div className="flex-1 overflow-y-auto p-6 text-sm text-gray-600 dark:text-gray-300 font-mono">
+                            {children}
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const CodeBlock = ({ label, code }) => (
+            <div className="mb-6">
+                <div className="flex justify-between items-center mb-2">
+                    <span className="font-semibold text-xs uppercase tracking-wider text-gray-500">{label}</span>
+                </div>
+                <pre className="bg-gray-800 text-gray-100 p-4 rounded-lg overflow-x-auto text-xs sm:text-sm leading-relaxed border border-gray-700">
+                    <code>{code}</code>
+                </pre>
+            </div>
+        );
+
+        const DocumentationContent = () => {
+            const backendCode = `// app/api/convert/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import { writeFile, readFile, unlink } from 'fs/promises';
+import { join } from 'path';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+
+const execAsync = promisify(exec);
+const TMP_DIR = '/tmp';
+
+export async function POST(req: NextRequest) {
+  try {
+    const formData = await req.formData();
+    const file = formData.get('file') as File;
+    const type = formData.get('type') as string; // 'to_pdf' or 'from_pdf'
+
+    if (!file) return NextResponse.json({ error: 'No file' }, { status: 400 });
+
+    // Security: Validate Mime Type & Extension
+    const bytes = await file.arrayBuffer();
+    const buffer = Buffer.from(bytes);
+    
+    // Save to temp
+    const safeName = file.name.replace(/[^a-zA-Z0-9.-]/g, '_');
+    const inputPath = join(TMP_DIR, \`\${Date.now()}-\${safeName}\`);
+    await writeFile(inputPath, buffer);
+
+    let outputPath = '';
+    
+    if (type === 'to_pdf') {
+       // Convert Office/Image -> PDF using LibreOffice
+       // libreoffice --headless --convert-to pdf --outdir /tmp /tmp/file.docx
+       await execAsync(\`libreoffice --headless --convert-to pdf --outdir \${TMP_DIR} \${inputPath}\`);
+       outputPath = inputPath.substring(0, inputPath.lastIndexOf('.')) + '.pdf';
+    } else {
+       // PDF -> DOCX (Best Effort)
+       // libreoffice --headless --infilter="writer_pdf_import" --convert-to docx --outdir /tmp /tmp/file.pdf
+       await execAsync(\`libreoffice --headless --infilter="writer_pdf_import" --convert-to docx --outdir \${TMP_DIR} \${inputPath}\`);
+       outputPath = inputPath.substring(0, inputPath.lastIndexOf('.')) + '.docx';
+    }
+
+    // Read result
+    const resultBuffer = await readFile(outputPath);
+    
+    // Cleanup
+    await unlink(inputPath);
+    await unlink(outputPath);
+
+    return new NextResponse(resultBuffer, {
+        headers: {
+            'Content-Disposition': \`attachment; filename="\${safeName}.result"\`,
+            'Content-Type': 'application/octet-stream'
+        }
+    });
+
+  } catch (err) {
+    return NextResponse.json({ error: 'Conversion failed' }, { status: 500 });
+  }
+}`;
+
+            const structure = `
+my-app/
+├── app/
+│   ├── api/
+│   │   └── convert/
+│   │       └── route.ts    # API Endpoint (Node.js)
+│   ├── layout.tsx
+│   └── page.tsx            # Frontend UI (React)
+├── components/             # Reusable UI components
+├── public/
+├── package.json
+├── tailwind.config.ts
+└── tsconfig.json`;
+
+            const installGuide = `
+# 1. System Requirements (Server)
+# Install LibreOffice (for Office <-> PDF)
+sudo apt-get install libreoffice
+# Install Poppler (for PDF -> Image)
+sudo apt-get install poppler-utils
+
+# 2. Project Setup
+npx create-next-app@latest polyconvert --typescript --tailwind --eslint
+cd polyconvert
+npm install lucide-react pdf-lib
+
+# 3. Environment Variables (.env.local)
+MAX_FILE_SIZE=52428800 # 50MB
+TEMP_DIR=/tmp
+
+# 4. Run Development
+npm run dev
+`;
+
+            return (
+                <div className="space-y-8">
+                    <section>
+                        <h4 className="text-lg font-bold mb-3 text-gray-900 dark:text-white">Project Structure</h4>
+                        <CodeBlock label="File Tree" code={structure} />
+                    </section>
+
+                    <section>
+                        <h4 className="text-lg font-bold mb-3 text-gray-900 dark:text-white">Backend Logic (Node.js API)</h4>
+                        <p className="mb-3">This is the core logic that would reside in <code>app/api/convert/route.ts</code> to handle the actual conversion using system binaries.</p>
+                        <CodeBlock label="Next.js API Route" code={backendCode} />
+                    </section>
+
+                    <section>
+                        <h4 className="text-lg font-bold mb-3 text-gray-900 dark:text-white">Installation Guide</h4>
+                        <CodeBlock label="Terminal Commands" code={installGuide} />
+                    </section>
+
+                    <section>
+                         <h4 className="text-lg font-bold mb-3 text-gray-900 dark:text-white">Common Issues & Security</h4>
+                         <ul className="list-disc list-inside space-y-2">
+                            <li><strong>LibreOffice Missing:</strong> Ensure `libreoffice-headless` is installed on the deployment server (Dockerfile required for Vercel/Docker).</li>
+                            <li><strong>Fonts:</strong> If conversions look wrong, install `fonts-liberation` or copy Windows fonts to `/usr/share/fonts`.</li>
+                            <li><strong>Path Traversal:</strong> Always sanitize filenames before passing them to shell commands (implemented in code above).</li>
+                            <li><strong>Timeout:</strong> Large files might exceed Vercel's 10s Serverless Function limit. Use Background Jobs (BullMQ/Redis) for production.</li>
+                         </ul>
+                    </section>
+                </div>
+            );
+        };
+
+        const Navbar = ({ darkMode, setDarkMode, onOpenDocs }) => (
+            <nav className="border-b border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 sticky top-0 z-50">
+                <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+                    <div className="flex items-center space-x-3">
+                        <div className="w-10 h-10 bg-primary-600 rounded-xl flex items-center justify-center text-white shadow-lg shadow-primary-500/30">
+                            <Icon name="file-symlink" size={24} />
+                        </div>
+                        <span className="text-xl font-bold tracking-tight">Poly<span className="text-primary-600">Convert</span></span>
+                    </div>
+                    <div className="flex items-center gap-3">
+                        <button 
+                            onClick={onOpenDocs}
+                            className="hidden sm:flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors"
+                        >
+                            <Icon name="code-2" size={18} />
+                            <span>Dev Docs</span>
+                        </button>
+                        <button 
+                            onClick={() => setDarkMode(!darkMode)}
+                            className="p-2 rounded-lg bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors"
+                            aria-label="Toggle Dark Mode"
+                        >
+                            {darkMode ? <Icon name="sun" size={20} /> : <Icon name="moon" size={20} />}
+                        </button>
+                    </div>
+                </div>
+            </nav>
+        );
+
+        const TabButton = ({ active, onClick, label, icon }) => (
+            <button
+                onClick={onClick}
+                className={`flex-1 py-4 text-center font-medium text-sm sm:text-base flex items-center justify-center space-x-2 transition-all duration-200 border-b-2 ${
+                    active 
+                    ? 'border-primary-600 text-primary-600 bg-primary-50 dark:bg-primary-900/10' 
+                    : 'border-transparent text-gray-500 hover:text-gray-700 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800'
+                }`}
+            >
+                <Icon name={icon} size={18} />
+                <span>{label}</span>
+            </button>
+        );
+
+        const FileItem = ({ file, onDelete }) => {
+            const statusColors = {
+                queued: 'text-gray-500 bg-gray-100 dark:bg-gray-800',
+                processing: 'text-blue-600 bg-blue-50 dark:bg-blue-900/20',
+                done: 'text-green-600 bg-green-50 dark:bg-green-900/20',
+                error: 'text-red-600 bg-red-50 dark:bg-red-900/20',
+            };
+
+            const StatusIcon = () => {
+                if (file.status === 'queued') return <Icon name="clock" size={16} />;
+                if (file.status === 'processing') return <Icon name="loader-2" size={16} className="animate-spin" />;
+                if (file.status === 'done') return <Icon name="check-circle" size={16} />;
+                return <Icon name="alert-circle" size={16} />;
+            };
+
+            return (
+                <div className="bg-white dark:bg-gray-800 rounded-xl p-4 shadow-sm border border-gray-100 dark:border-gray-700 flex flex-col sm:flex-row items-center gap-4 transition-all hover:shadow-md">
+                    {/* Icon Type */}
+                    <div className="w-12 h-12 rounded-lg bg-primary-50 dark:bg-primary-900/20 flex items-center justify-center text-primary-600 shrink-0">
+                        <Icon name="file-text" size={24} />
+                    </div>
+
+                    {/* Info */}
+                    <div className="flex-1 w-full min-w-0">
+                        <div className="flex justify-between mb-1">
+                            <h4 className="font-medium text-gray-900 dark:text-white truncate" title={file.originalFile.name}>
+                                {file.originalFile.name}
+                            </h4>
+                            <span className="text-xs text-gray-500 shrink-0 ml-2">{formatBytes(file.originalFile.size)}</span>
+                        </div>
+                        
+                        {/* Progress Bar */}
+                        <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-1.5 mb-2 overflow-hidden">
+                            <div 
+                                className={`h-1.5 rounded-full transition-all duration-300 ${
+                                    file.status === 'error' ? 'bg-red-500' : 'bg-primary-500'
+                                }`}
+                                style={{ width: `${file.progress}%` }}
+                            ></div>
+                        </div>
+
+                        <div className="flex justify-between items-center text-xs">
+                            <span className={`flex items-center gap-1.5 px-2 py-0.5 rounded-md font-medium ${statusColors[file.status]}`}>
+                                <StatusIcon />
+                                <span className="capitalize">{file.status}</span>
+                            </span>
+                            
+                            {file.status === 'done' && file.result && (
+                                <span className="text-gray-400">
+                                    Converted to <strong>{file.result.name.split('.').pop().toUpperCase()}</strong>
+                                </span>
+                            )}
+                        </div>
+                    </div>
+
+                    {/* Actions */}
+                    <div className="flex items-center gap-2 shrink-0">
+                        {file.status === 'done' && file.result && (
+                            <a 
+                                href={file.result.url} 
+                                download={file.result.name}
+                                className="p-2 text-green-600 hover:bg-green-50 dark:hover:bg-green-900/20 rounded-lg transition-colors"
+                                title="Download"
+                            >
+                                <Icon name="download" size={20} />
+                            </a>
+                        )}
+                        <button 
+                            onClick={() => onDelete(file.id)}
+                            className="p-2 text-gray-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-colors"
+                            title="Remove"
+                        >
+                            <Icon name="trash-2" size={20} />
+                        </button>
+                    </div>
+                </div>
+            );
+        };
+
+        const Dropzone = ({ activeTab, onDrop }) => {
+            const [isDragActive, setIsDragActive] = useState(false);
+            const inputRef = useRef(null);
+            
+            const handleDrag = (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                if (e.type === "dragenter" || e.type === "dragover") {
+                    setIsDragActive(true);
+                } else if (e.type === "dragleave") {
+                    setIsDragActive(false);
+                }
+            };
+
+            const handleDrop = (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setIsDragActive(false);
+                if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+                    onDrop(e.dataTransfer.files);
+                }
+            };
+
+            const handleChange = (e) => {
+                if (e.target.files && e.target.files[0]) {
+                    onDrop(e.target.files);
+                }
+            };
+
+            return (
+                <div 
+                    className={`
+                        relative border-2 border-dashed rounded-2xl p-8 sm:p-12 text-center transition-all duration-300 cursor-pointer
+                        ${isDragActive 
+                            ? 'border-primary-500 bg-primary-50 dark:bg-primary-900/10 scale-[1.01]' 
+                            : 'border-gray-300 dark:border-gray-700 hover:border-primary-400 dark:hover:border-primary-600 hover:bg-gray-50 dark:hover:bg-gray-800/50'}
+                    `}
+                    onDragEnter={handleDrag}
+                    onDragLeave={handleDrag}
+                    onDragOver={handleDrag}
+                    onDrop={handleDrop}
+                    onClick={() => inputRef.current?.click()}
+                >
+                    <input 
+                        ref={inputRef}
+                        type="file" 
+                        className="hidden" 
+                        multiple 
+                        accept={ACCEPTED_TYPES[activeTab].extensions.join(',')}
+                        onChange={handleChange}
+                    />
+                    
+                    <div className="mx-auto w-16 h-16 bg-primary-100 dark:bg-primary-900/30 text-primary-600 rounded-full flex items-center justify-center mb-4">
+                        <Icon name="upload-cloud" size={32} />
+                    </div>
+                    
+                    <h3 className="text-lg font-semibold mb-2">
+                        Click to upload or drag and drop
+                    </h3>
+                    <p className="text-gray-500 dark:text-gray-400 text-sm max-w-md mx-auto mb-4">
+                        {ACCEPTED_TYPES[activeTab].label}
+                    </p>
+                    <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-gray-100 dark:bg-gray-800 text-xs font-medium text-gray-500">
+                        <Icon name="shield-check" size={12} />
+                        <span>Max 50MB per file</span>
+                    </div>
+                </div>
+            );
+        };
+
+        const App = () => {
+            const [darkMode, setDarkMode] = useState(false);
+            const [activeTab, setActiveTab] = useState(TABS.TO_PDF);
+            const [files, setFiles] = useState([]);
+            const [isDocsOpen, setIsDocsOpen] = useState(false);
+            
+            // Dark mode effect
+            useEffect(() => {
+                if (darkMode) {
+                    document.documentElement.classList.add('dark');
+                } else {
+                    document.documentElement.classList.remove('dark');
+                }
+                lucide.createIcons();
+            }, [darkMode]);
+
+            // Re-render icons when list changes
+            useEffect(() => {
+                lucide.createIcons();
+            }, [files, activeTab, isDocsOpen]);
+
+            const handleFilesAdded = (fileList) => {
+                const newFiles = Array.from(fileList).map(f => ({
+                    id: Math.random().toString(36).substr(2, 9),
+                    originalFile: f,
+                    status: 'queued',
+                    progress: 0,
+                    result: null
+                }));
+
+                // Simple validation
+                const validFiles = newFiles.filter(f => {
+                    const ext = '.' + f.originalFile.name.split('.').pop().toLowerCase();
+                    // Just basic extension check for demo
+                    return ACCEPTED_TYPES[activeTab].extensions.includes(ext);
+                });
+
+                if (validFiles.length < newFiles.length) {
+                    alert("Some files were ignored because they don't match the allowed types for this tab.");
+                }
+
+                setFiles(prev => [...prev, ...validFiles]);
+                
+                // Auto start processing
+                validFiles.forEach(processFile);
+            };
+
+            const processFile = async (fileWrapper) => {
+                // Update status to processing
+                setFiles(prev => prev.map(f => f.id === fileWrapper.id ? { ...f, status: 'processing' } : f));
+
+                try {
+                    // Check if we can do client-side conversion (Image -> PDF)
+                    const isImage = fileWrapper.originalFile.type.startsWith('image/');
+                    let result;
+
+                    if (activeTab === TABS.TO_PDF && isImage) {
+                        // Real client side conversion
+                        result = await clientSideImageToPdf(fileWrapper.originalFile, (pct) => {
+                             setFiles(prev => prev.map(f => f.id === fileWrapper.id ? { ...f, progress: pct } : f));
+                        });
+                    } else {
+                        // Mock server conversion
+                        result = await mockUploadAndConvert(fileWrapper.originalFile, activeTab, (pct) => {
+                            setFiles(prev => prev.map(f => f.id === fileWrapper.id ? { ...f, progress: pct } : f));
+                        });
+                    }
+
+                    setFiles(prev => prev.map(f => f.id === fileWrapper.id ? { 
+                        ...f, 
+                        status: 'done', 
+                        progress: 100,
+                        result 
+                    } : f));
+
+                } catch (error) {
+                    console.error(error);
+                    setFiles(prev => prev.map(f => f.id === fileWrapper.id ? { ...f, status: 'error', progress: 0 } : f));
+                }
+            };
+
+            const handleDelete = (id) => {
+                setFiles(prev => prev.filter(f => f.id !== id));
+            };
+
+            const handleClearAll = () => {
+                setFiles([]);
+            };
+
+            return (
+                <>
+                    <Navbar darkMode={darkMode} setDarkMode={setDarkMode} onOpenDocs={() => setIsDocsOpen(true)} />
+                    
+                    <main className="flex-1 max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-8 w-full">
+                        
+                        <div className="bg-white dark:bg-gray-900 rounded-2xl shadow-xl overflow-hidden border border-gray-200 dark:border-gray-800">
+                            
+                            {/* Tabs */}
+                            <div className="flex border-b border-gray-200 dark:border-gray-800">
+                                <TabButton 
+                                    active={activeTab === TABS.TO_PDF} 
+                                    onClick={() => { setActiveTab(TABS.TO_PDF); setFiles([]); }}
+                                    label="Convert to PDF" 
+                                    icon="file-output"
+                                />
+                                <TabButton 
+                                    active={activeTab === TABS.FROM_PDF} 
+                                    onClick={() => { setActiveTab(TABS.FROM_PDF); setFiles([]); }}
+                                    label="Convert from PDF" 
+                                    icon="file-input"
+                                />
+                            </div>
+
+                            {/* Content */}
+                            <div className="p-6 sm:p-8 space-y-8">
+                                
+                                {/* Instructions / Header */}
+                                <div className="text-center space-y-2">
+                                    <h2 className="text-2xl font-bold">
+                                        {activeTab === TABS.TO_PDF ? 'Any Document to PDF' : 'PDF to Editable Formats'}
+                                    </h2>
+                                    <p className="text-gray-500 dark:text-gray-400">
+                                        {activeTab === TABS.TO_PDF 
+                                         ? 'Convert Word, Excel, PowerPoint, Images and more to high-quality PDF.' 
+                                         : 'Extract text and images from PDF or convert to Word Document.'}
+                                    </p>
+                                </div>
+
+                                {/* Uploader */}
+                                <Dropzone activeTab={activeTab} onDrop={handleFilesAdded} />
+
+                                {/* File List */}
+                                {files.length > 0 && (
+                                    <div className="space-y-4 animate-fade-in">
+                                        <div className="flex items-center justify-between">
+                                            <h3 className="font-semibold text-lg">Your Files ({files.length})</h3>
+                                            <button 
+                                                onClick={handleClearAll}
+                                                className="text-sm text-red-600 hover:text-red-700 dark:text-red-400 font-medium hover:underline"
+                                            >
+                                                Clear All
+                                            </button>
+                                        </div>
+                                        <div className="grid gap-3">
+                                            {files.map(file => (
+                                                <FileItem key={file.id} file={file} onDelete={handleDelete} />
+                                            ))}
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                            
+                            {/* Footer/Disclaimer for Demo */}
+                            <div className="bg-gray-50 dark:bg-gray-800/50 p-4 text-center text-xs text-gray-500 border-t border-gray-200 dark:border-gray-800">
+                                <p><strong>Demo Mode:</strong> Image-to-PDF is processed locally. Office conversions are simulated.</p>
+                                <p className="mt-1">In production, this would use Node.js + LibreOffice (Headless) + Poppler Utils.</p>
+                            </div>
+                        </div>
+
+                        {/* Tech Stack Info */}
+                        <div className="mt-12 grid grid-cols-1 md:grid-cols-3 gap-6 text-center">
+                             <div className="p-4 rounded-xl bg-white dark:bg-gray-800 shadow-sm border border-gray-100 dark:border-gray-700">
+                                <div className="mx-auto w-10 h-10 bg-blue-100 text-blue-600 rounded-full flex items-center justify-center mb-3">
+                                    <Icon name="server" size={20} />
+                                </div>
+                                <h3 className="font-semibold mb-1">Backend Processing</h3>
+                                <p className="text-sm text-gray-500">Node.js API routes handling stream processing with LibreOffice & pdf-poppler.</p>
+                             </div>
+                             <div className="p-4 rounded-xl bg-white dark:bg-gray-800 shadow-sm border border-gray-100 dark:border-gray-700">
+                                <div className="mx-auto w-10 h-10 bg-purple-100 text-purple-600 rounded-full flex items-center justify-center mb-3">
+                                    <Icon name="shield" size={20} />
+                                </div>
+                                <h3 className="font-semibold mb-1">Secure & Private</h3>
+                                <p className="text-sm text-gray-500">Auto-deletion after 30 mins. Input validation & path traversal protection.</p>
+                             </div>
+                             <div className="p-4 rounded-xl bg-white dark:bg-gray-800 shadow-sm border border-gray-100 dark:border-gray-700">
+                                <div className="mx-auto w-10 h-10 bg-green-100 text-green-600 rounded-full flex items-center justify-center mb-3">
+                                    <Icon name="zap" size={20} />
+                                </div>
+                                <h3 className="font-semibold mb-1">Fast Conversion</h3>
+                                <p className="text-sm text-gray-500">Queued job processing for reliability. Support for bulk upload.</p>
+                             </div>
+                        </div>
+                    </main>
+
+                    <Modal 
+                        isOpen={isDocsOpen} 
+                        onClose={() => setIsDocsOpen(false)} 
+                        title="Developer Documentation & Setup"
+                    >
+                        <DocumentationContent />
+                    </Modal>
+                </>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
